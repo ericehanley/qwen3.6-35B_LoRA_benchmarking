@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: debug-keys-pod
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+    cloud.google.com/gke-flex-start: "true"
+    cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+    cloud.google.com/gke-tpu-topology: "2x4"
+  tolerations:
+  - key: "google.com/tpu"
+    operator: "Equal"
+    value: "present"
+    effect: "NoSchedule"
+  initContainers:
+  - name: download-model
+    image: google/cloud-sdk:slim
+    command:
+    - "bash"
+    - "-c"
+    - |
+      set -ex
+      mkdir -p /osmosis/models/Qwen/Qwen3.6-35B-A3B
+      gcloud storage cp gs://ank-qwen-serving-314837540096/qwen36-35b-weights/*.json /osmosis/models/Qwen/Qwen3.6-35B-A3B/
+    volumeMounts:
+    - name: osmosis-volume
+      mountPath: /osmosis
+  containers:
+  - name: main
+    image: vllm/vllm-tpu
+    command:
+    - "bash"
+    - "-c"
+    - |
+      pip install accelerate peft
+      python3 -c '
+      import textwrap
+      code = """
+      from transformers import AutoConfig, AutoModelForMultimodalLM
+      import torch
+      import json
+      import os
+      
+      print("Loading config...", flush=True)
+      config = AutoConfig.from_pretrained("/osmosis/models/Qwen/Qwen3.6-35B-A3B", trust_remote_code=True)
+      
+      print("Initializing model on meta device...", flush=True)
+      with torch.device("meta"):
+          model = AutoModelForMultimodalLM.from_config(config, trust_remote_code=True)
+          
+      from vllm.config import ModelConfig
+      from vllm.multimodal import MULTIMODAL_REGISTRY
+      import os
+      
+      model_path = "/osmosis/models/Qwen/Qwen3.6-35B-A3B"
+      
+      for seq_len in [1024, 2048, 4096, 8192, 16384]:
+          model_config = ModelConfig(
+              model=model_path,
+              tokenizer=model_path,
+              tokenizer_mode="auto",
+              trust_remote_code=True,
+              dtype="bfloat16",
+              seed=0,
+              max_model_len=seq_len,
+          )
+          processor = MULTIMODAL_REGISTRY.create_processor(model_config)
+          max_toks = processor.info.get_mm_max_tokens_per_item(seq_len=seq_len, mm_counts={"image": 1, "video": 1})
+          print(f"seq_len={seq_len} -> max_tokens_per_mm_item: {max_toks}", flush=True)
+      """
+      exec(textwrap.dedent(code))
+      '
+    volumeMounts:
+    - name: osmosis-volume
+      mountPath: /osmosis
+  restartPolicy: Never
+  volumes:
+  - name: osmosis-volume
+    emptyDir:
+      medium: Memory

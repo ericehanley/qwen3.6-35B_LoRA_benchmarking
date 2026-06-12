@@ -1,0 +1,17 @@
+{
+  "base_model_name_or_path": "/osmosis/models/Qwen/Qwen3.6-35B-A3B",
+  "bias": "none",
+  "fan_in_fan_out": false,
+  "inference_mode": true,
+  "lora_alpha": 32,
+  "lora_dropout": 0.0,
+  "peft_type": "LORA",
+  "r": 32,
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj"
+  ],
+  "task_type": "CAUSAL_LM"
+}

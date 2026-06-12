@@ -1,0 +1,167 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-lora-bench
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      initContainers:
+      - name: download-merged-model
+        image: google/cloud-sdk:slim
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Downloading merged model from GCS..."
+          mkdir -p /osmosis/merged_model
+          gcloud storage cp -r gs://llama-vllm-results-bucket/qwen3.6-35b-merged/* /osmosis/merged_model/
+          echo "Download complete."
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu
+        args:
+        - "vllm"
+        - "serve"
+        - "/osmosis/merged_model"
+        - "--tensor-parallel-size"
+        - "8"
+        - "--data-parallel-size"
+        - "1"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--max-num-batched-tokens"
+        - "16384"
+        - "--max-model-len"
+        - "2048"
+        - "--gpu-memory-utilization"
+        - "0.60"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "1200"
+        resources:
+          limits:
+            google.com/tpu: "8"
+          requests:
+            google.com/tpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: osmosis-volume
+          mountPath: /osmosis
+      - name: native-bench-client
+        image: vllm/vllm-tpu
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm' EXIT
+          
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+          echo "Server is ready."
+          echo "Running a single prompt sanity check..."
+          curl -s -X POST http://localhost:8000/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "/osmosis/merged_model",
+                "messages": [{"role": "user", "content": "Explain why the sky is blue in one sentence."}],
+                "max_tokens": 50,
+                "temperature": 0.0
+              }' | python3 -c "import sys, json; print('SANITY CHECK RESPONSE:', json.load(sys.stdin)['choices'][0]['message']['content'])"
+          
+          echo "Starting native Qwen3.6-35B LoRA benchmarks..."
+          mkdir -p /workspace/output
+          
+          echo "Running native benchmark, input len 1024, output len 128..."
+          vllm bench serve \
+              --model /osmosis/merged_model \
+              --tokenizer /osmosis/merged_model \
+              --dataset-name random \
+              --input-len 1024 \
+              --output-len 128 \
+              --num-prompts 1000 \
+              --num-warmups 20 \
+              --metric-percentiles 50,90,95,99 \
+              --percentile-metrics ttft,tpot,itl,e2el \
+              --save-result \
+              --result-dir /workspace/output \
+              --result-filename native_p1024_results.json \
+              --request-rate 8 \
+              --base-url http://localhost:8000
+          
+          echo "Native benchmarks completed. Installing google-cloud-storage..."
+          pip install google-cloud-storage
+          
+          echo "Uploading results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("llama-vllm-results-bucket", "/workspace/output", "qwen3.6-35b-merged-bench/v6e/tp8-dp1_prompt_size_results")
+          '
+          echo "All results uploaded successfully. Shutting down co-located vLLM server process..."
+          pkill -f vllm
+          echo "Cleanup complete."
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory

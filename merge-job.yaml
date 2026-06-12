@@ -1,0 +1,156 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-merge-job
+spec:
+  template:
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      initContainers:
+      - name: download-model-and-adapter
+        image: google/cloud-sdk:slim
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Downloading base model from GCS..."
+          mkdir -p /osmosis/models/Qwen/Qwen3.6-35B-A3B
+          gcloud storage cp -r gs://ank-qwen-serving-314837540096/qwen36-35b-weights/* /osmosis/models/Qwen/Qwen3.6-35B-A3B/
+          
+          echo "Downloading LoRA adapter from GCS..."
+          gcloud storage cp gs://llama-vllm-results-bucket/qwen_adapter/* /osmosis/
+          mv /osmosis/adapter.safetensors /osmosis/adapter_model.safetensors
+          echo "Download complete."
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      containers:
+      - name: merge-worker
+        image: vllm/vllm-tpu
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Installing peft..."
+          pip install peft
+          echo "Starting merge script..."
+          python3 -c '
+          import os
+          import torch
+          from peft import PeftModel
+          from transformers import AutoModelForMultimodalLM, AutoTokenizer, AutoProcessor
+          from transformers import conversion_mapping
+          
+          # Clear the moe_text conversion cache immediately before model loading
+          conversion_mapping.get_checkpoint_conversion_mapping("legacy")
+          if conversion_mapping._checkpoint_conversion_mapping_cache is not None:
+              conversion_mapping._checkpoint_conversion_mapping_cache["qwen3_5_moe_text"] = []
+          
+          def merge():
+              base_model_path = "/osmosis/models/Qwen/Qwen3.6-35B-A3B"
+              adapter_path = "/osmosis"
+              output_path = "/osmosis/merged_model"
+              
+              print("Loading base model (multimodal LM) in bfloat16...")
+              model = AutoModelForMultimodalLM.from_pretrained(
+                  base_model_path,
+                  torch_dtype=torch.bfloat16,
+                  device_map="cpu",
+                  trust_remote_code=True
+              )
+              
+              print("Loading adapter...")
+              model = PeftModel.from_pretrained(model, adapter_path, local_files_only=True)
+              
+              print("Merging weights...")
+              model = model.merge_and_unload()
+              
+              print("Resetting model weight conversions to prevent buggy key renaming...")
+              model._weight_conversions = None
+              if hasattr(model, "model"):
+                  model.model._weight_conversions = None
+              
+              print(f"Saving merged model to {output_path}...")
+              model.save_pretrained(output_path, safe_serialization=True)
+              
+              print("Saving tokenizer...")
+              tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+              tokenizer.save_pretrained(output_path)
+              
+              print("Saving processor...")
+              try:
+                  processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
+                  processor.save_pretrained(output_path)
+              except Exception as e:
+                  print(f"Processor save failed/skipped: {e}", flush=True)
+                  
+              print("Merge complete!")
+          
+          merge()
+          '
+          
+          echo "Merge step completed. Installing google-cloud-storage..."
+          pip install google-cloud-storage
+          
+          echo "Uploading merged model to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          from google.cloud.storage import transfer_manager
+          
+          def upload_dir_fast(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              
+              file_paths = []
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      file_paths.append(os.path.join(root, file))
+                      
+              file_paths.sort()
+              print(f"Uploading {len(file_paths)} files sequentially with chunk parallelization...", flush=True)
+              
+              for filename in file_paths:
+                  relative_path = os.path.relpath(filename, local_dir)
+                  blob_name = f"{gcs_prefix}/{relative_path}"
+                  file_size = os.path.getsize(filename)
+                  print(f"Starting upload: {relative_path} ({file_size / (1024*1024):.1f} MB) -> gs://{bucket_name}/{blob_name}...", flush=True)
+                  try:
+                      blob = bucket.blob(blob_name)
+                      if file_size > 256 * 1024 * 1024:
+                          print("Uploading in parallel chunks...", flush=True)
+                          transfer_manager.upload_chunks_concurrently(
+                              filename,
+                              blob,
+                              chunk_size=100 * 1024 * 1024,
+                              max_workers=8
+                          )
+                      else:
+                          blob.upload_from_filename(filename)
+                      print(f"Successfully uploaded: {relative_path}", flush=True)
+                  except Exception as e:
+                      print(f"Failed to upload {relative_path} due to exception: {e}", flush=True)
+                      raise e
+          
+          upload_dir_fast("llama-vllm-results-bucket", "/osmosis/merged_model", "qwen3.6-35b-merged")
+          '
+          echo "All merged weights uploaded successfully!"
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory

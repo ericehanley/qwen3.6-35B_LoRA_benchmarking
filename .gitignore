@@ -1,0 +1,5 @@
+# Model Weights / Large Artifacts
+adapter.safetensors
+
+# macOS System Files
+.DS_Store

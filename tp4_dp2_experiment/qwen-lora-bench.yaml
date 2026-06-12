@@ -1,0 +1,275 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-lora-bench
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      initContainers:
+      - name: download-merged-model
+        image: google/cloud-sdk:slim
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Downloading merged model from GCS..."
+          mkdir -p /osmosis/merged_model
+          gcloud storage cp -r gs://llama-vllm-results-bucket/qwen3.6-35b-merged/* /osmosis/merged_model/
+          echo "Download complete."
+          
+          echo "Creating local load balancer proxy script..."
+          cat << 'EOF' > /osmosis/proxy.py
+          import http.server
+          import socketserver
+          import urllib.request
+          import urllib.error
+          import threading
+          import sys
+
+          TARGET_PORTS = [8001, 8002]
+          current_index = 0
+          lock = threading.Lock()
+
+          class ProxyHandler(http.server.BaseHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  pass
+
+              def do_GET(self):
+                  self.proxy_request("GET")
+
+              def do_POST(self):
+                  self.proxy_request("POST")
+
+              def proxy_request(self, method):
+                  global current_index
+                  with lock:
+                      port = TARGET_PORTS[current_index]
+                      current_index = (current_index + 1) % len(TARGET_PORTS)
+
+                  url = f"http://127.0.0.1:{port}{self.path}"
+                  
+                  content_length = int(self.headers.get('Content-Length', 0))
+                  body = self.rfile.read(content_length) if content_length > 0 else None
+
+                  headers = {key: val for key, val in self.headers.items() if key.lower() not in ['host', 'connection', 'content-length']}
+                  
+                  req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=120) as response:
+                          self.send_response(response.status)
+                          for key, val in response.getheaders():
+                              if key.lower() not in ['transfer-encoding', 'connection']:
+                                  self.send_header(key, val)
+                          self.end_headers()
+                          while True:
+                              chunk = response.read(1024)
+                              if not chunk:
+                                  break
+                              self.wfile.write(chunk)
+                              self.wfile.flush()
+                  except urllib.error.HTTPError as e:
+                      self.send_response(e.code)
+                      for key, val in e.headers.items():
+                          if key.lower() not in ['transfer-encoding', 'connection']:
+                              self.send_header(key, val)
+                      self.end_headers()
+                      self.wfile.write(e.read())
+                  except urllib.error.URLError as e:
+                      import socket
+                      is_conn_refused = False
+                      if isinstance(e.reason, ConnectionRefusedError):
+                          is_conn_refused = True
+                      elif isinstance(e.reason, OSError) and e.reason.errno == 111:
+                          is_conn_refused = True
+                      
+                      if is_conn_refused:
+                          self.send_response(503)
+                          self.end_headers()
+                          self.wfile.write(b"Service Unavailable (Backend booting...)")
+                      else:
+                          import traceback
+                          traceback.print_exc()
+                          self.send_response(500)
+                          self.end_headers()
+                          self.wfile.write(str(e).encode())
+                  except Exception as e:
+                      import traceback
+                      traceback.print_exc()
+                      self.send_response(500)
+                      self.end_headers()
+                      self.wfile.write(str(e).encode())
+
+
+          def run_proxy(port=8000):
+              handler = ProxyHandler
+              # Enable address reuse to avoid port binding conflicts
+              socketserver.TCPServer.allow_reuse_address = True
+              with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
+                  print(f"Proxy serving on port {port} forwarding to {TARGET_PORTS}...", flush=True)
+                  httpd.serve_forever()
+
+          if __name__ == "__main__":
+              run_proxy()
+          EOF
+
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -ex
+          python3 /osmosis/proxy.py &
+          
+          echo "Starting Server 0 on port 8001 (chips 0-3)..."
+          TPU_VISIBLE_CHIPS="0,1,2,3" vllm serve /osmosis/merged_model \
+            --tensor-parallel-size 4 \
+            --data-parallel-size 1 \
+            --port 8001 \
+            --max-num-batched-tokens 16384 \
+            --max-model-len 2048 \
+            --gpu-memory-utilization 0.55 \
+            --max-num-seqs 128 \
+            --trust-remote-code > /osmosis/server0.log 2>&1 &
+            
+          echo "Starting Server 1 on port 8002 (chips 4-7)..."
+          TPU_VISIBLE_CHIPS="4,5,6,7" vllm serve /osmosis/merged_model \
+            --tensor-parallel-size 4 \
+            --data-parallel-size 1 \
+            --port 8002 \
+            --max-num-batched-tokens 16384 \
+            --max-model-len 2048 \
+            --gpu-memory-utilization 0.55 \
+            --max-num-seqs 128 \
+            --trust-remote-code > /osmosis/server1.log 2>&1 &
+            
+          sleep 5
+          tail -f /osmosis/server0.log /osmosis/server1.log
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "1200"
+        resources:
+          limits:
+            google.com/tpu: "8"
+          requests:
+            google.com/tpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: osmosis-volume
+          mountPath: /osmosis
+      - name: native-bench-client
+        image: vllm/vllm-tpu
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm' EXIT
+          
+          echo "Waiting for vLLM servers..."
+          until curl -sf http://127.0.0.1:8001/health && curl -sf http://127.0.0.1:8002/health; do
+            sleep 5
+          done
+          echo "Both servers are ready."
+
+          echo "Running a single prompt sanity check..."
+          curl -s -X POST http://localhost:8000/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "/osmosis/merged_model",
+                "messages": [{"role": "user", "content": "Explain why the sky is blue in one sentence."}],
+                "max_tokens": 50,
+                "temperature": 0.0
+              }' | python3 -c "import sys, json; print('SANITY CHECK RESPONSE:', json.load(sys.stdin)['choices'][0]['message']['content'])"
+          
+          echo "Starting native Qwen3.6-35B LoRA benchmarks..."
+          mkdir -p /workspace/output
+          
+          echo "Running native benchmark, input len 1024, output len 128..."
+          vllm bench serve \
+              --model /osmosis/merged_model \
+              --tokenizer /osmosis/merged_model \
+              --dataset-name random \
+              --input-len 1024 \
+              --output-len 128 \
+              --num-prompts 1000 \
+              --num-warmups 20 \
+              --metric-percentiles 50,90,95,99 \
+              --percentile-metrics ttft,tpot,itl,e2el \
+              --save-result \
+              --result-dir /workspace/output \
+              --result-filename native_p1024_results.json \
+              --request-rate 8 \
+              --base-url http://localhost:8000
+          
+          echo "Native benchmarks completed. Installing google-cloud-storage..."
+          pip install google-cloud-storage
+          
+          echo "Uploading results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("llama-vllm-results-bucket", "/workspace/output", "qwen3.6-35b-merged-bench/v6e/tp8-dp1_prompt_size_results")
+          '
+          echo "All results uploaded successfully. Shutting down co-located vLLM server process..."
+          pkill -f vllm
+          echo "Cleanup complete."
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory
