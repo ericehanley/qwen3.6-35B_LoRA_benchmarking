@@ -34,7 +34,7 @@ This repository contains Kubernetes manifests, automation scripts, and serving p
 * **`merge-job.yaml`**: Mounts an SSD persistent volume, downloads the base Qwen3.6 weights and LoRA adapters from GCS, installs PEFT dependencies, and runs an in-memory python script to merge the weights. The final merged weights are saved on the shared volume for local serving.
 
 ### 3. Serving Benchmarks (TP=8, DP=1)
-* **`qwen-lora-bench-tp8-dp1.yaml`**: The primary recommended manifest. Launches the unified vLLM server with TP=8 sharding alongside a benchmark client pod running fmbench/InferenceX against the API server endpoint.
+* **`qwen-lora-bench-tp8-dp1.yaml`**: The primary recommended manifest. Launches the unified vLLM server with TP=8 sharding alongside a benchmark client container running native `vllm bench serve` against the local API server endpoint.
 
 ### 4. Disjoint TP=4, DP=2 Load-Balanced Serving
 * **`tp4_dp2_experiment/`**: Standard JAX data parallelism (DP > 1) crashes during compilation for multimodal models because JAX sharding maps the visual encoder's batch dimension of `1` onto the DP axis. This subproject bypasses that compile error by splitting the 8-chip TPU slice into two independent vLLM JAX processes (`TP=4, DP=1` each) and load balancing them using **`proxy.py`**.
