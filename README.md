@@ -13,7 +13,8 @@ This repository contains Kubernetes manifests, automation scripts, and serving p
 ├── adapter_config.json            # LoRA adapter configuration metadata
 ├── merge-job.yaml                 # GKE Job for base model + LoRA weight merging
 ├── create_gke_tpu_cluster.sh      # Bash script to create standard GKE cluster with TPU v6e
-├── qwen-lora-bench-tp8-dp1.yaml   # Benchmark client + vLLM serving pod manifest (TP=8, DP=1)
+├── qwen-base-bench-tp8-dp1.yaml   # Benchmark client + vLLM serving pod manifest for base model (TP=8, DP=1)
+├── qwen-lora-bench-tp8-dp1.yaml   # Benchmark client + vLLM serving pod manifest for LoRA merged model (TP=8, DP=1)
 ├── qwen-lora-bench.yaml           # Baseline benchmark manifest
 ├── benchmark_results_summary.md   # Finalized benchmarking report & latency sweeps analysis
 └── tp4_dp2_experiment/            # Disjoint process load-balanced TP=4, DP=2 serve experiment
@@ -34,7 +35,8 @@ This repository contains Kubernetes manifests, automation scripts, and serving p
 * **`merge-job.yaml`**: Mounts an SSD persistent volume, downloads the base Qwen3.6 weights and LoRA adapters from GCS, installs PEFT dependencies, and runs an in-memory python script to merge the weights. The final merged weights are saved on the shared volume for local serving.
 
 ### 3. Serving Benchmarks (TP=8, DP=1)
-* **`qwen-lora-bench-tp8-dp1.yaml`**: The primary recommended manifest. Launches the unified vLLM server with TP=8 sharding alongside a benchmark client container running native `vllm bench serve` against the local API server endpoint.
+* **`qwen-base-bench-tp8-dp1.yaml`**: Manifest to run the benchmark sweep (concurrency 8, 16, 32, 64) for the untuned/base model `Qwen/Qwen3.6-35B-A3B` on TPU v6e-8.
+* **`qwen-lora-bench-tp8-dp1.yaml`**: The primary recommended manifest for merged model. Launches the unified vLLM server with TP=8 sharding alongside a benchmark client container running native `vllm bench serve` against the local API server endpoint.
 
 ### 4. Disjoint TP=4, DP=2 Load-Balanced Serving
 * **`tp4_dp2_experiment/`**: Standard JAX data parallelism (DP > 1) crashes during compilation for multimodal models because JAX sharding maps the visual encoder's batch dimension of `1` onto the DP axis. This subproject bypasses that compile error by splitting the 8-chip TPU slice into two independent vLLM JAX processes (`TP=4, DP=1` each) and load balancing them using **`proxy.py`**.

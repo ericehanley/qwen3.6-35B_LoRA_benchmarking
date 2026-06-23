@@ -1,0 +1,208 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-base-bench
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        args:
+        - "vllm"
+        - "serve"
+        - "Qwen/Qwen3.6-35B-A3B"
+        - "--tensor-parallel-size"
+        - "8"
+        - "--data-parallel-size"
+        - "1"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--served-model-name"
+        - "Qwen/Qwen3.6-35B-A3B"
+        - "--max-model-len"
+        - "131072"
+        - "--max-num-batched-tokens"
+        - "16384"
+        - "--gpu-memory-utilization"
+        - "0.80"
+        - "--max-num-seqs"
+        - "64"
+        - "--enable-prefix-caching"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "1200"
+        resources:
+          limits:
+            google.com/tpu: "8"
+          requests:
+            google.com/tpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: osmosis-volume
+          mountPath: /osmosis
+      - name: native-bench-client
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm' EXIT
+          
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+          echo "Server is ready."
+          echo "Running a single prompt sanity check..."
+          curl -s -X POST http://localhost:8000/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "messages": [{"role": "user", "content": "Explain why the sky is blue in one sentence."}],
+                "max_tokens": 50,
+                "temperature": 0.0
+              }' | python3 -c "import sys, json; print('SANITY CHECK RESPONSE:', json.load(sys.stdin)['choices'][0]['message']['content'])"
+          
+          echo "Starting native Qwen3.6-35B base benchmarks..."
+          mkdir -p /workspace/output
+          
+          for C in 8 16 32 64; do
+            NUM_PROMPTS=$((C * 10))
+            echo "Running benchmark at concurrency ${C} with ${NUM_PROMPTS} prompts..."
+            vllm bench serve \
+                --backend openai \
+                --model Qwen/Qwen3.6-35B-A3B \
+                --tokenizer Qwen/Qwen3.6-35B-A3B \
+                --dataset-name random \
+                --random-input-len 6400 \
+                --random-prefix-len 2600 \
+                --random-output-len 600 \
+                --ignore-eos \
+                --max-concurrency $C \
+                --num-prompts $NUM_PROMPTS \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename "base_c${C}_results.json" \
+                --base-url http://localhost:8000
+          done
+          
+          echo "Displaying summary table of all benchmark results..."
+          python3 -c '
+          import glob
+          import json
+          import os
+
+          files = glob.glob("/workspace/output/base_c*_results.json")
+          def get_concurrency(f):
+              name = os.path.basename(f)
+              parts = name.split("_")
+              for p in parts:
+                  if p.startswith("c") and p[1:].isdigit():
+                      return int(p[1:])
+              return 0
+
+          files.sort(key=get_concurrency)
+
+          print("\n================ BENCHMARK SUMMARY TABLE ================")
+          print("| Concurrency | Completed | Failed | Req/s | Output tok/s | Total tok/s | TTFT med/P99 (ms) | TPOT med/P99 (ms) | ITL med/P99 (ms) |")
+          print("|---|---|---|---|---|---|---|---|---|")
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      data = json.load(fh)
+                  concurrency = get_concurrency(f)
+                  completed = data.get("completed", 0)
+                  failed = data.get("failed", 0)
+                  req_s = f"{data.get(\"request_throughput\", 0.0):.2f}"
+                  out_tok_s = f"{data.get(\"output_throughput\", 0.0):.0f}"
+                  tot_tok_s = f"{data.get(\"total_token_throughput\", 0.0):.0f}"
+                  
+                  ttft_med = f"{data.get(\"median_ttft_ms\", data.get(\"p50_ttft_ms\", 0.0)):.0f}"
+                  ttft_p99 = f"{data.get(\"p99_ttft_ms\", 0.0):.0f}"
+                  
+                  tpot_med = f"{data.get(\"median_tpot_ms\", data.get(\"p50_tpot_ms\", 0.0)):.1f}"
+                  tpot_p99 = f"{data.get(\"p99_tpot_ms\", 0.0):.1f}"
+                  
+                  itl_med = f"{data.get(\"median_itl_ms\", data.get(\"p50_itl_ms\", 0.0)):.1f}"
+                  itl_p99 = f"{data.get(\"p99_itl_ms\", 0.0):.1f}"
+                  
+                  print(f"| {concurrency} | {completed} | {failed} | {req_s} | {out_tok_s} | {tot_tok_s} | {ttft_med} / {ttft_p99} | {tpot_med} / {tpot_p99} | {itl_med} / {itl_p99} |")
+              except Exception as e:
+                  print(f"Failed to read/parse {f}: {e}")
+          print("=========================================================\n")
+          '
+          
+          echo "Native benchmarks completed. Installing google-cloud-storage..."
+          pip install google-cloud-storage
+          
+          echo "Uploading results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("llama-vllm-results-bucket", "/workspace/output", "qwen3.6-35b-base-bench/v6e/tp8-dp1_prompt_size_results")
+          '
+          echo "All results uploaded successfully. Shutting down co-located vLLM server process..."
+          pkill -f vllm
+          echo "Cleanup complete."
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory

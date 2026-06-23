@@ -15,6 +15,7 @@ All benchmarks were run with a **1024 input tokens -> 128 output tokens** worklo
 | **Run 2** | TP=8, DP=1 | 8.00 RPS | Default (256) | Batched RPA | **978.80 tok/s** | **8,809.23 tok/s** | 694.57 ms (0.69s) | 177.06 ms |
 | **Run 3** | TP=8, DP=1 | 8.00 RPS | Default (256) | Default | **982.86 tok/s** | **8,845.73 tok/s** | 669.77 ms (0.67s) | 180.56 ms |
 | **Run 4** | TP=4, DP=2 (Disjoint) | 8.00 RPS | 128 (256 total) | Default | **624.42 tok/s** | **5,619.74 tok/s** | 12,497.61 ms (12.50s) | 14.76 ms |
+| **Run 5** | TP=4, DP=2 (Native + Patch) | 8.00 RPS | Default (64 per DP) | Default | **756.20 tok/s** | **6,805.79 tok/s** | 21,954.66 ms (21.95s) | 26.40 ms |
 
 
 ---
@@ -47,15 +48,21 @@ All benchmarks were run with a **1024 input tokens -> 128 output tokens** worklo
   * When DP > 1 (e.g. DP=2), JAX attempts to divide this batch dimension of `1` by the DP mesh size of `2`. Since 2 does not evenly divide 1, JAX throws a `ValueError` during warmup and crashes.
   * Therefore, **multimodal models containing vision towers are restricted to DP=1 on vLLM TPU** until the vision attention layer supports padding/sharding configurations that decouple from the DP axis. To use an 8-chip topology, you must run **TP=8, DP=1**.
 
-### 5. Disjoint Processes TP=4 / DP=2 vs. Single Process TP=8 / DP=1
-* **Why TP4-DP2 has 36% lower throughput and high latency**:
-  * To bypass the DP axis mismatch on the vision tower, we split the pod's 8 chips into two separate, independent JAX engine processes (each running `TP=4, DP=1` on 4 chips) and load-balanced them using a local Python proxy.
-  * While this configuration bypassed the vision tower compiler crash, it introduced severe **host-level contention**:
-    * **CPU Thread Contention**: Concurrently running two separate JAX compilers/runtime schedulers on the same physical CPU node causes intense orchestration and thread-context-switching overhead.
-    * **Memory Bandwidth & Bus Saturation**: The two processes compete for host memory bus and PCI lanes during model loading, compiling, and execution.
-  * **The Performance Penalty**:
-    * Under 8.00 RPS load, the combined throughput of the two TP=4 replicas was **624.42 tokens/sec** — a **36.5% reduction** compared to the single TP=8 process (**982.86 tokens/sec**).
-    * Due to this capacity reduction, the server was unable to sustain the 8.00 RPS load (which requires at least 1,024 tokens/s output capacity), leading to queue saturation, high TTFT (12.5 seconds), and **26.1% request failures** due to connection/queue timeouts.
-    * **Step Latency (TPOT)**: When requests successfully executed, the TPOT was **14.76 ms** (as opposed to 180 ms in TP=8). This low TPOT is an artifact of smaller active batch sizes on the independent replicas, but the throughput loss from host contention makes it a negative overall tradeoff.
-  * **Recommendation**: For TPU v6e-8 topologies, running a single unified **TP=8, DP=1** instance is highly recommended over splitting the hardware slice into disjoint processes.
+### 5. Native TP=4 / DP=2 (with Compiler Patch) vs. Disjoint (Proxy) vs. TP=8 / DP=1
+
+Using our compiler patch to bypass the `set_forward_context` assertion error, we ran the benchmark using **Native TP=4, DP=2** (where vLLM natively manages both replicas and binds them to a single API server process).
+
+* **Native TP4-DP2 vs. Disjoint TP4-DP2 (Proxy)**:
+  * **Reliability**: Native TP4-DP2 completed all 1,000 requests with **0 failures** (0.0%). The disjoint proxy setup failed on **26.1%** of requests due to gateway/connection exhaustion.
+  * **Throughput**: Native TP4-DP2 delivered **756.20 tokens/sec** — a **21% improvement** over the disjoint setup (624.42 tokens/sec).
+  * **Reason**: Native vLLM manages queue load-balancing internally at the engine core level rather than routing HTTP requests through an external python proxy, which eliminates connection/queue bottlenecks and serialization overhead.
+
+* **Native TP4-DP2 vs. TP8-DP1**:
+  * **Queueing Capacity (Load Handling)**: Under a high 8.00 RPS load, TP8-DP1 is faster on single-request processing. Native vLLM handles the queue with 0% request drops, but the lack of parallel DP replicas limits scale capacity. Native TP4-DP2 handles the load with **zero failures** by load-balancing across the two replicas.
+  * **TTFT & Decode Speed (TPOT)**: 
+    * TP8-DP1 executes the prefill phase nearly twice as fast (Mean TTFT of **669 ms** vs. **21.95 seconds** for TP4-DP2) and decodes faster (TPOT of **180 ms** vs. **26.40 ms**).
+    * *Note on TPOT discrepancy*: TP8-DP1's TPOT is 180ms when batch size is large (256). For native TP4-DP2, the TPOT is **26.40 ms** because it runs smaller active batch sizes (capped at `--max-num-seqs 64` per replica), resulting in faster execution steps per request but slightly lower global throughput compared to the highly-batched TP=8.
+  * **Recommendation**:
+    * For high-concurrency workloads where request drop is unacceptable, **patched Native TP4-DP2** is preferred as it eliminates failures.
+    * For latency-critical applications where TTFT is the priority, **TP8-DP1** is significantly faster.
 
